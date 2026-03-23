@@ -9,7 +9,7 @@ class PhraseAttentionExtractor(nn.Module):
     改进的关键词提取器：支持短语级提取 + 注意力机制
     """
     def __init__(self, encoder: nn.Module, max_phrases: int, phrase_dim: int, max_phrase_len: int = 5):
-        super().__init__()
+        super().__init__() # 修正语法错误
         self.encoder = encoder
         self.max_phrases = max_phrases
         self.phrase_dim = phrase_dim
@@ -19,7 +19,7 @@ class PhraseAttentionExtractor(nn.Module):
         # 跨度评分网络：融合起始、结束、平均、差值特征
         self.span_scorer = nn.Sequential(
             nn.Linear(hidden_size * 4, hidden_size),
-            nn.LayerNorm(hidden_size), # ✅ 增加归一化提升稳定性
+            nn.LayerNorm(hidden_size), 
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_size, 1)
@@ -52,11 +52,10 @@ class PhraseAttentionExtractor(nn.Module):
         batch_phrase_scores = []
         batch_phrase_spans = []
 
-        # 逐样本处理（支持短语跨度枚举）
+        # 逐样本处理
         for b in range(B):
             valid_spans = []
             
-            # 枚举所有合法短语跨度
             for i in range(L):
                 if not mask[b, i]: continue
                 for j in range(i, min(L, i + self.max_phrase_len)):
@@ -68,29 +67,30 @@ class PhraseAttentionExtractor(nn.Module):
                     mean_emb = span_emb.mean(dim=0)
                     diff_emb = end_emb - start_emb
 
-                    # 拼接特征计算得分
                     feature = torch.cat([start_emb, end_emb, mean_emb, diff_emb], dim=-1)
-                    score = self.span_scorer(feature)
+                    score = self.span_scorer(feature) # (1)
 
                     valid_spans.append((score, i, j, mean_emb))
 
-            # 按得分排序，取 top-k
-            valid_spans.sort(key=lambda x: x[0], reverse=True)
+            # 修正点 1：确保排序键是标量，避免 Tensor 比较报错
+            valid_spans.sort(key=lambda x: x[0].item(), reverse=True)
+            
             topk = min(self.max_phrases, len(valid_spans))
             topk_list = valid_spans[:topk]
             
             topk_features = [s[3] for s in topk_list]
             topk_indices = [(s[1], s[2]) for s in topk_list]
-            topk_scores = [s[0] for s in topk_list]
+            topk_scores = [s[0].reshape(1) for s in topk_list] # 统一形状
 
             # 填充补齐
             while len(topk_features) < self.max_phrases:
                 topk_features.append(torch.zeros(hidden.size(-1), device=device))
                 topk_indices.append((0, 0))
-                topk_scores.append(torch.tensor(-10.0, device=device)) # 低分填充
+                topk_scores.append(torch.tensor([-10.0], device=device)) # 低分填充
 
             batch_phrase_embs.append(torch.stack(topk_features))
-            batch_phrase_scores.append(torch.stack(topk_scores).squeeze())
+            # 修正点 2：显式拼接分数，确保维度为 (max_phrases)
+            batch_phrase_scores.append(torch.cat(topk_scores, dim=0))
             batch_phrase_masks.append(torch.tensor([1]*topk + [0]*(self.max_phrases - topk), dtype=torch.bool, device=device))
             batch_phrase_spans.append(topk_indices)
 
@@ -120,7 +120,6 @@ class EnhancedChineseTextEmbedding(nn.Module):
         super().__init__()
         self.tokenizer = tokenizer
         
-        # 指向 Taiyi-Stable-Diffusion 的目录
         taiyi_sd_path = '/home/610-sty/huggingface/Taiyi-Stable-Diffusion-1B-Chinese-v0.1'
         self.text_encoder = AutoModel.from_pretrained(f"{taiyi_sd_path}/text_encoder")
         self.roberta = self.text_encoder.base_model
@@ -131,7 +130,7 @@ class EnhancedChineseTextEmbedding(nn.Module):
         self.global_proj = nn.Linear(self.text_encoder.config.hidden_size, embed_dim)
         self.phrase_proj = nn.Linear(self.text_encoder.config.hidden_size, phrase_dim)
 
-        # ✅ 增加输出归一化层，杜绝 NaN 向 UNet 传递
+        # ✅ 增加输出归一化层，杜绝向量量级过大导致 NaN
         self.out_norm_global = nn.LayerNorm(embed_dim)
         self.out_norm_local = nn.LayerNorm(phrase_dim)
 
@@ -158,12 +157,12 @@ class EnhancedChineseTextEmbedding(nn.Module):
         # 全局特征：取 [CLS] 并归一化
         global_embed = self.out_norm_global(self.global_proj(poem_output[:, 0]))
 
-        if is_inference and self.use_learnable_extractor:
+        if (is_inference or phrases is None) and self.use_learnable_extractor:
             phrase_data = self.keyword_extractor(poem_tokens.input_ids, poem_tokens.attention_mask)
             return {
                 "global_embed": global_embed,
                 "local_embeds": phrase_data["phrase_embeds"],
-                "local_mask": phrase_data["phrase_masks"],
+                "local_mask": phrase_data["phrase_masks"], # ✅ 这个 mask 会传给 UNet 解决报错
                 "raw_text": poems,
                 "phrase_attention": phrase_data["phrase_attention"],
                 "phrase_scores": phrase_data["phrase_scores"],
@@ -178,7 +177,7 @@ class EnhancedChineseTextEmbedding(nn.Module):
             
         local_embeds, local_mask = self.encode_phrases(all_phrases, device)
         
-        # ✅ 对手动编码的短语也进行归一化
+        # ✅ 对短语也进行归一化
         local_embeds = self.out_norm_local(local_embeds)
 
         return {
@@ -195,28 +194,27 @@ class EnhancedChineseTextEmbedding(nn.Module):
         for phrase_list in all_phrases:
             if not phrase_list:
                 batch_local_embeds.append(self.phrase_pad.unsqueeze(0).expand(self.max_phrases, -1))
-                batch_local_mask.append([0] * self.max_phrases)
+                batch_local_mask.append(torch.zeros(self.max_phrases, dtype=torch.bool, device=device))
                 continue
 
             phrase_tokens = self.tokenizer(
                 phrase_list, return_tensors="pt", padding=True, truncation=True, max_length=10
             ).to(device)
             
-            # 提取每个短语的 [CLS]
             phrase_out = self.roberta(**phrase_tokens).last_hidden_state[:, 0]
             phrase_embed = self.phrase_proj(phrase_out)
 
-            # 填充
+            # 填充逻辑
             if phrase_embed.size(0) < self.max_phrases:
                 pad_len = self.max_phrases - phrase_embed.size(0)
                 pad = self.phrase_pad.unsqueeze(0).expand(pad_len, -1)
                 phrase_embed = torch.cat([phrase_embed, pad], dim=0)
-                mask = [1] * len(phrase_list) + [0] * pad_len
+                mask = torch.tensor([True] * len(phrase_list) + [False] * pad_len, device=device)
             else:
                 phrase_embed = phrase_embed[:self.max_phrases]
-                mask = [1] * self.max_phrases
+                mask = torch.tensor([True] * self.max_phrases, device=device)
 
             batch_local_embeds.append(phrase_embed)
             batch_local_mask.append(mask)
 
-        return torch.stack(batch_local_embeds), torch.tensor(batch_local_mask, device=device, dtype=torch.bool)
+        return torch.stack(batch_local_embeds), torch.stack(batch_local_mask)
