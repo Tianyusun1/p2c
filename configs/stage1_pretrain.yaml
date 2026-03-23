@@ -1,0 +1,32 @@
+# @package _global_
+defaults:
+  - _self_
+
+# 硬件配置
+hardware:
+  accelerator: "gpu"
+  devices: [0]
+  precision: "16-mixed"
+  seed: 42
+
+# 数据配置
+data:
+  train_shards: ["/home/610-sty/data/shanshui_tars/{00000..00173}.tar"]
+  resolution: 512
+  phrase_drop_rate: 0.3
+  synonym_prob: 0.4
+  batch_size: 32
+
+# 模型配置
+model:
+  text_encoder: "/home/610-sty/huggingface/Taiyi-CLIP-Roberta-large-326M-Chinese"
+  sd_path: "/home/610-sty/huggingface/stable-diffusion-v1-5"
+  freeze_unet: true
+  text_encoder_train_layers: [8,9,10,11]  # 仅训练最后4层
+
+# 优化配置
+optim:
+  lr: 1e-4
+  warmup_steps: 500
+  max_steps: 10000
+  grad_clip: 1.0
