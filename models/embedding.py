@@ -19,6 +19,7 @@ class PhraseAttentionExtractor(nn.Module):
         # 跨度评分网络：融合起始、结束、平均、差值特征
         self.span_scorer = nn.Sequential(
             nn.Linear(hidden_size * 4, hidden_size),
+            nn.LayerNorm(hidden_size), # ✅ 增加归一化提升稳定性
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_size, 1)
@@ -27,15 +28,15 @@ class PhraseAttentionExtractor(nn.Module):
         # 短语特征投影
         self.proj = nn.Linear(hidden_size, phrase_dim)
 
-        # 注意力门控机制（用于融合多个短语）
+        # 注意力门控机制
         self.attention_gate = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.Tanh(),
             nn.Linear(hidden_size // 2, 1)
         )
 
-        # 可选：增加位置编码（增强位置感知）
-        self.position_emb = nn.Embedding(max_phrase_len, hidden_size)
+        # 最终输出归一化
+        self.out_norm = nn.LayerNorm(phrase_dim)
 
     def forward(self, input_ids, attention_mask):
         B, L = input_ids.shape
@@ -49,73 +50,69 @@ class PhraseAttentionExtractor(nn.Module):
         batch_phrase_embs = []
         batch_phrase_masks = []
         batch_phrase_scores = []
-        batch_phrase_spans = []  # 用于调试/可视化
+        batch_phrase_spans = []
 
-        # 逐样本处理
+        # 逐样本处理（支持短语跨度枚举）
         for b in range(B):
             valid_spans = []
-            span_features = []
-
+            
             # 枚举所有合法短语跨度
             for i in range(L):
                 if not mask[b, i]: continue
                 for j in range(i, min(L, i + self.max_phrase_len)):
                     if not mask[b, j]: break
 
-                    start_emb = hidden[b, i]  # (D,)
-                    end_emb = hidden[b, j]    # (D,)
-                    span_emb = hidden[b, i:j+1]  # (len, D)
-                    mean_emb = span_emb.mean(dim=0)  # (D,)
-                    diff_emb = end_emb - start_emb  # (D,)
+                    start_emb = hidden[b, i]
+                    end_emb = hidden[b, j]
+                    span_emb = hidden[b, i:j+1]
+                    mean_emb = span_emb.mean(dim=0)
+                    diff_emb = end_emb - start_emb
 
-                    # 拼接特征
-                    feature = torch.cat([start_emb, end_emb, mean_emb, diff_emb], dim=-1)  # (4*D,)
-                    score = self.span_scorer(feature).squeeze()  # scalar
+                    # 拼接特征计算得分
+                    feature = torch.cat([start_emb, end_emb, mean_emb, diff_emb], dim=-1)
+                    score = self.span_scorer(feature)
 
-                    valid_spans.append((score, i, j))
-                    span_features.append(mean_emb)  # 使用平均池化作为短语表示
+                    valid_spans.append((score, i, j, mean_emb))
 
             # 按得分排序，取 top-k
             valid_spans.sort(key=lambda x: x[0], reverse=True)
             topk = min(self.max_phrases, len(valid_spans))
-            topk_spans = valid_spans[:topk]
-            topk_features = [span_features[valid_spans.index(s)] for s in topk_spans]
+            topk_list = valid_spans[:topk]
+            
+            topk_features = [s[3] for s in topk_list]
+            topk_indices = [(s[1], s[2]) for s in topk_list]
+            topk_scores = [s[0] for s in topk_list]
 
-            # 填充至 max_phrases
+            # 填充补齐
             while len(topk_features) < self.max_phrases:
-                topk_features.append(torch.zeros_like(span_features[0]))
-            while len(topk_spans) < self.max_phrases:
-                topk_spans.append((torch.tensor(-float('inf')).to(device), 0, 0))
+                topk_features.append(torch.zeros(hidden.size(-1), device=device))
+                topk_indices.append((0, 0))
+                topk_scores.append(torch.tensor(-10.0, device=device)) # 低分填充
 
-            # 堆叠
-            phrase_embs = torch.stack(topk_features)  # (K, D)
-            phrase_scores = torch.stack([s for s, _, _ in topk_spans])  # (K,)
-            phrase_mask = torch.tensor([1]*topk + [0]*(self.max_phrases - topk), dtype=torch.bool, device=device)
+            batch_phrase_embs.append(torch.stack(topk_features))
+            batch_phrase_scores.append(torch.stack(topk_scores).squeeze())
+            batch_phrase_masks.append(torch.tensor([1]*topk + [0]*(self.max_phrases - topk), dtype=torch.bool, device=device))
+            batch_phrase_spans.append(topk_indices)
 
-            batch_phrase_embs.append(phrase_embs)
-            batch_phrase_scores.append(phrase_scores)
-            batch_phrase_masks.append(phrase_mask)
-            batch_phrase_spans.append([(i, j) for _, i, j in topk_spans])
-
-        # 堆叠 batch
+        # 堆叠 Batch
         phrase_embs = torch.stack(batch_phrase_embs)  # (B, K, D)
         phrase_scores = torch.stack(batch_phrase_scores)  # (B, K)
         phrase_masks = torch.stack(batch_phrase_masks)  # (B, K)
 
-        # 注意力权重计算（门控机制）
-        gate_logits = self.attention_gate(phrase_embs).squeeze(-1)  # (B, K)
-        gate_logits = gate_logits.masked_fill(~phrase_masks, float('-inf'))
-        phrase_attention = torch.softmax(gate_logits, dim=-1)  # (B, K)
+        # 注意力权重计算
+        gate_logits = self.attention_gate(phrase_embs).squeeze(-1)
+        gate_logits = gate_logits.masked_fill(~phrase_masks, -1e9)
+        phrase_attention = torch.softmax(gate_logits, dim=-1)
 
-        # 投影到 phrase_dim
-        phrase_embeds = self.proj(phrase_embs)  # (B, K, phrase_dim)
+        # 投影与归一化
+        phrase_embeds = self.out_norm(self.proj(phrase_embs))
 
         return {
             "phrase_embeds": phrase_embeds,
             "phrase_masks": phrase_masks,
             "phrase_attention": phrase_attention,
             "phrase_scores": phrase_scores,
-            "phrase_spans": batch_phrase_spans  # 用于调试
+            "phrase_spans": batch_phrase_spans
         }
 
 class EnhancedChineseTextEmbedding(nn.Module):
@@ -123,23 +120,26 @@ class EnhancedChineseTextEmbedding(nn.Module):
         super().__init__()
         self.tokenizer = tokenizer
         
-        # ✅ 修改点：指向 Taiyi-Stable-Diffusion 的 text_encoder 目录
+        # 指向 Taiyi-Stable-Diffusion 的目录
         taiyi_sd_path = '/home/610-sty/huggingface/Taiyi-Stable-Diffusion-1B-Chinese-v0.1'
         self.text_encoder = AutoModel.from_pretrained(f"{taiyi_sd_path}/text_encoder")
-        
         self.roberta = self.text_encoder.base_model
+        
         self.max_phrases = max_phrases
         self.use_learnable_extractor = use_learnable_extractor
 
         self.global_proj = nn.Linear(self.text_encoder.config.hidden_size, embed_dim)
         self.phrase_proj = nn.Linear(self.text_encoder.config.hidden_size, phrase_dim)
 
+        # ✅ 增加输出归一化层，杜绝 NaN 向 UNet 传递
+        self.out_norm_global = nn.LayerNorm(embed_dim)
+        self.out_norm_local = nn.LayerNorm(phrase_dim)
+
         if self.use_learnable_extractor:
             self.keyword_extractor = PhraseAttentionExtractor(
                 encoder=self.roberta,
                 max_phrases=self.max_phrases,
-                phrase_dim=phrase_dim,
-                max_phrase_len=5  # 可调
+                phrase_dim=phrase_dim
             )
 
         self.register_buffer('phrase_pad', torch.zeros(phrase_dim))
@@ -149,23 +149,17 @@ class EnhancedChineseTextEmbedding(nn.Module):
 
     def forward(self, poems, phrases=None, is_inference=False):
         device = next(self.parameters()).device
-        batch_size = len(poems)
-
+        
         poem_tokens = self.tokenizer(
-            poems,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=77
+            poems, return_tensors="pt", padding=True, truncation=True, max_length=77
         ).to(device)
-        poem_output = self.roberta(**poem_tokens).last_hidden_state  # (B, L, D)
-        global_embed = self.global_proj(poem_output[:, 0])  # [CLS] -> (B, 768)
+        
+        poem_output = self.roberta(**poem_tokens).last_hidden_state
+        # 全局特征：取 [CLS] 并归一化
+        global_embed = self.out_norm_global(self.global_proj(poem_output[:, 0]))
 
         if is_inference and self.use_learnable_extractor:
-            phrase_data = self.keyword_extractor(
-                input_ids=poem_tokens.input_ids,
-                attention_mask=poem_tokens.attention_mask
-            )
+            phrase_data = self.keyword_extractor(poem_tokens.input_ids, poem_tokens.attention_mask)
             return {
                 "global_embed": global_embed,
                 "local_embeds": phrase_data["phrase_embeds"],
@@ -175,12 +169,17 @@ class EnhancedChineseTextEmbedding(nn.Module):
                 "phrase_scores": phrase_data["phrase_scores"],
                 "phrase_spans": phrase_data["phrase_spans"]
             }
-        elif is_inference and not self.use_learnable_extractor:
+
+        # 静态提取或训练阶段
+        if is_inference:
             all_phrases = [self.extract_keywords_static(p, top_k=self.max_phrases) for p in poems]
-            local_embeds, local_mask = self.encode_phrases(all_phrases, device)
         else:
             all_phrases = [p[:self.max_phrases] if p else [] for p in phrases]
-            local_embeds, local_mask = self.encode_phrases(all_phrases, device)
+            
+        local_embeds, local_mask = self.encode_phrases(all_phrases, device)
+        
+        # ✅ 对手动编码的短语也进行归一化
+        local_embeds = self.out_norm_local(local_embeds)
 
         return {
             "global_embed": global_embed,
@@ -190,39 +189,34 @@ class EnhancedChineseTextEmbedding(nn.Module):
         }
 
     def encode_phrases(self, all_phrases, device):
-        local_embeds = []
-        local_mask = []
+        batch_local_embeds = []
+        batch_local_mask = []
 
         for phrase_list in all_phrases:
-            phrase_len = len(phrase_list)
-            if phrase_len == 0:
-                phrase_embed = self.phrase_pad.unsqueeze(0).expand(self.max_phrases, -1)
-                local_embeds.append(phrase_embed)
-                local_mask.append([0] * self.max_phrases)
+            if not phrase_list:
+                batch_local_embeds.append(self.phrase_pad.unsqueeze(0).expand(self.max_phrases, -1))
+                batch_local_mask.append([0] * self.max_phrases)
                 continue
 
             phrase_tokens = self.tokenizer(
-                phrase_list,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=10
+                phrase_list, return_tensors="pt", padding=True, truncation=True, max_length=10
             ).to(device)
-            phrase_output = self.roberta(**phrase_tokens).last_hidden_state[:, 0]  # (K, D)
-            phrase_embed = self.phrase_proj(phrase_output)
+            
+            # 提取每个短语的 [CLS]
+            phrase_out = self.roberta(**phrase_tokens).last_hidden_state[:, 0]
+            phrase_embed = self.phrase_proj(phrase_out)
 
+            # 填充
             if phrase_embed.size(0) < self.max_phrases:
                 pad_len = self.max_phrases - phrase_embed.size(0)
-                pad = self.phrase_pad.unsqueeze(0).expand(pad_len, phrase_embed.shape[-1])
+                pad = self.phrase_pad.unsqueeze(0).expand(pad_len, -1)
                 phrase_embed = torch.cat([phrase_embed, pad], dim=0)
-                mask = [1] * phrase_len + [0] * pad_len
+                mask = [1] * len(phrase_list) + [0] * pad_len
             else:
                 phrase_embed = phrase_embed[:self.max_phrases]
                 mask = [1] * self.max_phrases
 
-            local_embeds.append(phrase_embed)
-            local_mask.append(mask)
+            batch_local_embeds.append(phrase_embed)
+            batch_local_mask.append(mask)
 
-        local_embeds = torch.stack(local_embeds)  # (B, K, 128)
-        local_mask = torch.tensor(local_mask, device=device, dtype=torch.bool)  # (B, K)
-        return local_embeds, local_mask
+        return torch.stack(batch_local_embeds), torch.tensor(batch_local_mask, device=device, dtype=torch.bool)

@@ -51,22 +51,13 @@ class LocalInjectionAttnProcessor(nn.Module): # 继承 nn.Module
 
     def _init_lora_weights(self):
         """初始化 LoRA 权重，使用较小的随机值"""
-        if self.to_q_lora is not None:
-            nn.init.xavier_uniform_(self.to_q_lora[0].weight)
-            nn.init.zeros_(self.to_q_lora[1].weight)  # 输出层初始化为0，避免初始干扰
-            
-        if self.to_k_lora is not None:
-            nn.init.xavier_uniform_(self.to_k_lora[0].weight)
-            nn.init.zeros_(self.to_k_lora[1].weight)
-            
-        if self.to_v_lora is not None:
-            nn.init.xavier_uniform_(self.to_v_lora[0].weight)
-            nn.init.zeros_(self.to_v_lora[1].weight)
-            
-        if self.to_out_lora is not None:
-            nn.init.xavier_uniform_(self.to_out_lora[0].weight)
-            nn.init.zeros_(self.to_out_lora[1].weight)
-
+        for lora_module in [self.to_q_lora, self.to_k_lora, self.to_v_lora, self.to_out_lora]:
+                    if lora_module is not None:
+                        # 第一层：Truncated Normal
+                        nn.init.trunc_normal_(lora_module[0].weight, std=0.01)
+                        # 第二层：必须为 0，确保训练刚开始时 LoRA 分支对主模型没有干扰
+                        nn.init.zeros_(lora_module[1].weight)
+                        
     def __call__(
         self,
         attn,

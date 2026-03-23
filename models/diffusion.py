@@ -5,8 +5,7 @@ from torch import nn
 from diffusers import AutoencoderKL, DDPMScheduler
 from torchvision.utils import save_image
 import lpips
-from models.unet_custom import CustomUNet2DConditionModel
-
+from models.unet_custom import CustomUNet2DConditionModel 
 from transformers import BertTokenizer, AutoModel
 
 class DiffusionModel(nn.Module):
@@ -16,97 +15,84 @@ class DiffusionModel(nn.Module):
         # 1. 加载预训练模块
         self.vae = AutoencoderKL.from_pretrained(config["pretrained_vae_path"])
         
-        # ✅ 核心优化：强制指定 cross_attention_dim=768 以匹配 Taiyi-SD
+        # 自动识别维度，确保加载权重成功
         self.unet = CustomUNet2DConditionModel.from_pretrained(
             config["pretrained_unet_path"],
             ignore_mismatched_sizes=True,
-            low_cpu_mem_usage=False,
-            cross_attention_dim=768
+            low_cpu_mem_usage=False
         )
         
-        # ✅ 关键修改：减少可训练参数
-        # 首先冻结 UNet 的所有主干权重
+        # 冻结 UNet 主干，仅训练自定义适配层和 LoRA
         self.unet.requires_grad_(False)
         
-        # 仅解冻自定义适配层 (Adapter Layers)
-        self.unet.fused_text_proj.requires_grad_(True)
-        self.unet.local_to_fused.requires_grad_(True)
-        self.unet.context_fusion.requires_grad_(True)
-        
-        # 显式解冻 LoRA 参数 (位于各层 processor 中)
+        # 显式解冻适配器层
+        trainable_names = ["fused_text_proj", "local_to_fused", "context_fusion", "processor"]
         for name, module in self.unet.named_modules():
-            if "processor" in name:
+            if any(key in name for key in trainable_names):
                 for param in module.parameters():
                     param.requires_grad = True
 
         self.noise_scheduler = DDPMScheduler.from_pretrained(config["pretrained_scheduler_path"])
         self.prediction_type = config.get("prediction_type", "epsilon")
-        self.perceptual_loss_weight = config.get("perceptual_loss_weight", 0.05)
 
-        # 冻结 VAE 参数
+        # 冻结 VAE
         self.vae.requires_grad_(False)
+        self.vae.eval()
 
-        # LPIPS 感知损失
-        self.lpips_loss = lpips.LPIPS(net='alex')
-        self.lpips_loss.eval()
+        # LPIPS 感知损失：强制评估模式并冻结
+        self.lpips_loss = lpips.LPIPS(net='alex').eval()
         self.lpips_loss.requires_grad_(False)
 
-        # 局部特征映射层 (解冻)
+        # 辅助特征投影层（增加初始化保护）
         self.local_proj = nn.Linear(128, 768)
-        self.local_proj.requires_grad_(True)
+        nn.init.xavier_uniform_(self.local_proj.weight)
 
-        # 自动迁移 noise_scheduler 参数到 GPU
-        scheduler_device = next(self.unet.parameters()).device
-        for name, value in vars(self.noise_scheduler).items():
-            if isinstance(value, torch.Tensor):
-                setattr(self.noise_scheduler, name, value.to(scheduler_device))
-
-        # 使用 Taiyi-SD 的 Text Encoder 计算 CLIP Loss
+        # 使用 Taiyi-SD 的 Text Encoder 计算语义对齐 Loss
         taiyi_sd_path = "/home/610-sty/huggingface/Taiyi-Stable-Diffusion-1B-Chinese-v0.1"
-        self.clip_text_encoder = AutoModel.from_pretrained(f"{taiyi_sd_path}/text_encoder").to(self.unet.device)
+        self.clip_text_encoder = AutoModel.from_pretrained(f"{taiyi_sd_path}/text_encoder")
         self.clip_tokenizer = BertTokenizer.from_pretrained(f"{taiyi_sd_path}/tokenizer")
+        self.clip_text_encoder.eval().requires_grad_(False)
 
-        self.clip_text_encoder.eval()
-        self.clip_text_encoder.requires_grad_(False)
-
-        # 添加投影层 (维度 768)
+        # 语义空间投影：使用极小的初始化，防止初期产生巨大梯度
         self.text_proj = nn.Linear(768, 768)
-        self.image_proj = nn.Linear(3, 768)
+        self.image_proj = nn.Linear(3, 768) 
+        with torch.no_grad():
+            nn.init.normal_(self.text_proj.weight, std=0.01)
+            nn.init.normal_(self.image_proj.weight, std=0.01)
+        
+        # Loss 权重配置
+        self.perceptual_loss_weight = config.get("perceptual_loss_weight", 0.01)
+        self.clip_loss_weight = 0.0        # ⚠ 初始设为 0，等训练稳定后再开启
         self.tv_loss_weight = 0.001
 
     @staticmethod
     def tv_loss(img):
-        # ✅ 强制转为 float32 防止 fp16 下溢出崩溃
-        img = img.float()
+        """全变分损失：减少生成噪声"""
+        img = img.float() 
         batch_size, c, h, w = img.size()
         h_diff = torch.sum(torch.abs(img[:, :, 1:, :] - img[:, :, :-1, :]))
         w_diff = torch.sum(torch.abs(img[:, :, :, 1:] - img[:, :, :, :-1]))
-        return (h_diff + w_diff) / (c * h * w)
+        return (h_diff + w_diff) / (c * h * w + 1e-8)
 
     def train_step(self, images, text_embeddings):
-        # 修正图像范围
-        if images.min() < -1.5 or images.max() > 1.5:
-            images = torch.clamp(images, -1.0, 1.0)
-
-        images = images.to(dtype=torch.float32)
-        device = self.unet.device
-
+        # 1. 数据准备与安全裁剪
+        images = images.to(dtype=torch.float32).clamp(-1.0, 1.0)
+        device = images.device
+        
         global_embed = text_embeddings['global_embed'].to(device)
         local_embeds = text_embeddings['local_embeds'].to(device)
 
+        # 2. VAE 编码
         with torch.no_grad():
             latents = self.vae.encode(images).latent_dist.sample()
-        latents = latents * 0.18215
+            latents = latents * 0.18215
 
+        # 3. 加噪流程
         noise = torch.randn_like(latents)
-        timesteps = torch.randint(
-            0, self.noise_scheduler.config.num_train_timesteps,
-            (latents.shape[0],), device=latents.device
-        ).long()
-
+        timesteps = torch.randint(0, 1000, (latents.shape[0],), device=device).long()
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
-        # UNet 前向传播
+        # 4. UNet 前向预测
         noise_pred = self.unet(
             noisy_latents,
             timesteps,
@@ -114,83 +100,84 @@ class DiffusionModel(nn.Module):
             local_embeds=local_embeds
         ).sample
 
-        # 基础 MSE Loss
+        # ✅ 核心优化 1：数值裁剪
+        # 防止 UNet 输出的预测值过大导致 MSE 直接变为 NaN
+        noise_pred = torch.clamp(noise_pred, -20.0, 20.0)
+
+        # 5. 计算主损失：使用 Huber Loss 替代标准 MSE
+        # Huber Loss 对离群值（Outliers）更鲁棒，能有效防止梯度爆炸
         if self.prediction_type == "v_prediction":
             alpha_t = self.noise_scheduler.alphas_cumprod[timesteps].sqrt().view(-1, 1, 1, 1)
             sigma_t = (1 - self.noise_scheduler.alphas_cumprod[timesteps]).sqrt().view(-1, 1, 1, 1)
-            v_target = alpha_t * noise - sigma_t * latents
-            mse_loss = F.mse_loss(noise_pred, v_target)
+            target = alpha_t * noise - sigma_t * latents
+            loss_main = F.huber_loss(noise_pred.float(), target.float(), delta=1.0)
         else:
-            mse_loss = F.mse_loss(noise_pred, noise)
+            target = noise
+            loss_main = F.huber_loss(noise_pred.float(), target.float(), delta=1.0)
 
-        # 辅助 Loss 计算 (VAE 解码安全保护)
-        with torch.no_grad():
-            # ✅ 修复：必须除以 0.18215 并强制转 FP32 防止 Core Dump
-            latents_for_decode = (latents / 0.18215).float()
-            original_vae_dtype = next(self.vae.parameters()).dtype
-            self.vae.to(torch.float32)
-            pred_images = self.vae.decode(latents_for_decode).sample
-            self.vae.to(original_vae_dtype)
-            gt_images = images
+        # 6. 计算辅助损失
+        perceptual_loss = torch.tensor(0.0, device=device)
+        clip_loss = torch.tensor(0.0, device=device)
+        tv_loss_value = torch.tensor(0.0, device=device)
 
-        # ✅ 感知损失 (强制 float32)
-        perceptual_loss = self.lpips_loss(pred_images.float().clamp(-1, 1), gt_images.float().clamp(-1, 1)).mean()
+        if self.perceptual_loss_weight > 0:
+            with torch.no_grad():
+                # 稳定版感知引导：直接使用 ground-truth latents 的解码图
+                pred_images = self.vae.decode(latents / 0.18215).sample
+            perceptual_loss = self.lpips_loss(pred_images.clamp(-1, 1), images).mean()
+            tv_loss_value = self.tv_loss(pred_images)
 
-        # CLIP loss
-        raw_texts = text_embeddings.get('raw_text', ["a photo"] * pred_images.shape[0])
-        text_inputs = self.clip_tokenizer(
-            raw_texts, padding=True, truncation=True, max_length=77, return_tensors="pt"
-        ).to(device)
-        text_outputs = self.clip_text_encoder(**text_inputs)
-        text_features = self.text_proj(text_outputs.last_hidden_state.mean(dim=1))
-        
-        image_features = self.image_proj(pred_images.mean(dim=[2, 3]))
-        
-        # ✅ 归一化安全保护 (加 eps 防止除 0)
-        text_features = F.normalize(text_features.float(), p=2, dim=-1, eps=1e-8)
-        image_features = F.normalize(image_features.float(), p=2, dim=-1, eps=1e-8)
+        if self.clip_loss_weight > 0:
+            self.clip_text_encoder.to(device)
+            raw_texts = text_embeddings.get('raw_text', [""] * images.shape[0])
+            text_inputs = self.clip_tokenizer(raw_texts, padding=True, truncation=True, return_tensors="pt").to(device)
+            text_features = self.clip_text_encoder(**text_inputs).last_hidden_state.mean(dim=1)
+            
+            # 投影与归一化安全保护
+            text_features = F.normalize(self.text_proj(text_features), p=2, dim=-1, eps=1e-8)
+            image_features = F.normalize(self.image_proj(pred_images.mean(dim=[2, 3])), p=2, dim=-1, eps=1e-8)
+            
+            clip_sim = (image_features * text_features).sum(dim=1).mean()
+            clip_loss = 1.0 - clip_sim
 
-        clip_sim = (image_features * text_features).sum(dim=1).mean()
-        clip_loss = 1 - clip_sim
-        tv_loss_value = self.tv_loss(pred_images)
-
-        # 合并 Total Loss
+        # 7. 合并总损失
         total_loss = (
-            mse_loss +
-            0.05 * perceptual_loss + 
-            0.1 * clip_loss +       
-            0.001 * tv_loss_value   
+            loss_main +
+            self.perceptual_loss_weight * perceptual_loss + 
+            self.clip_loss_weight * clip_loss +       
+            self.tv_loss_weight * tv_loss_value   
         )
+
+        # --- 深度调试打印 ---
+        if torch.isnan(total_loss):
+            print("\n❌ [NaN Detected in DiffusionModel]")
+            print(f"   - Huber/MSE Loss: {loss_main.item():.6f}")
+            print(f"   - Noise Pred Max: {noise_pred.abs().max().item():.4f}")
+            # 返回一个连接到计算图的 0 损失，防止训练中断
+            return sum(p.sum() * 0 for p in self.parameters() if p.requires_grad)
 
         return total_loss
 
-    def validation_step(self, images, text_embeddings):
-        return self.train_step(images, text_embeddings)
-
     @torch.no_grad()
-    def generate_images(self, text_embeddings, save_path=None, num_images=1, image_hint=None):
+    def generate_images(self, text_embeddings, num_images=1):
+        """推理生成逻辑"""
         self.unet.eval()
         device = self.unet.device
-
+        
         global_embed = text_embeddings['global_embed'].to(device)
         local_embeds = text_embeddings['local_embeds'].to(device)
-
-        latents = torch.randn((num_images, 4, 64, 64), device=device) * 0.18215
-
-        for t in reversed(range(self.noise_scheduler.config.num_train_timesteps)):
-            timesteps = torch.tensor(t, dtype=torch.long, device=device)
+        
+        # 初始噪声
+        latents = torch.randn((num_images, 4, 64, 64), device=device)
+        
+        # DDIM 采样循环
+        for t in reversed(range(len(self.noise_scheduler.alphas_cumprod))):
+            timesteps = torch.tensor([t], device=device).expand(num_images)
             noise_pred = self.unet(latents, timesteps, global_embed=global_embed, local_embeds=local_embeds).sample
-            latents = self.noise_scheduler.step(model_output=noise_pred, timestep=timesteps, sample=latents).prev_sample
-
-        # 推理时 FP32 保护
-        latents = (latents / 0.18215).float()
-        original_vae_dtype = next(self.vae.parameters()).dtype
+            latents = self.noise_scheduler.step(noise_pred, t, latents).prev_sample
+            
+        # 解码前强制 FP32
+        latents = (latents / 0.18215).to(torch.float32)
         self.vae.to(torch.float32)
         images = self.vae.decode(latents).sample
-        self.vae.to(original_vae_dtype)
-
-        images = (images.clamp(-1, 1) + 1) / 2
-        if save_path:
-            save_image(images, save_path, nrow=2)
-
-        return images
+        return (images.clamp(-1, 1) + 1) / 2
