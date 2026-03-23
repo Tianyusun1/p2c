@@ -83,7 +83,7 @@ def main():
         max_epochs=args.max_epochs,
         callbacks=[checkpoint_callback, lr_monitor],
         logger=logger,
-        precision="16",       # 混合精度训练
+        precision="16",             # 混合精度训练
         gradient_clip_val=1.0,
         log_every_n_steps=10,       # 适度的日志频率
         enable_checkpointing=True,

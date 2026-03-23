@@ -122,9 +122,11 @@ class EnhancedChineseTextEmbedding(nn.Module):
     def __init__(self, tokenizer, embed_dim=768, phrase_dim=128, max_phrases=5, use_learnable_extractor=True):
         super().__init__()
         self.tokenizer = tokenizer
-        self.text_encoder = AutoModel.from_pretrained(
-            '/home/610-sty/huggingface/Taiyi-CLIP-Roberta-large-326M-Chinese'
-        )
+        
+        # ✅ 修改点：指向 Taiyi-Stable-Diffusion 的 text_encoder 目录
+        taiyi_sd_path = '/home/610-sty/huggingface/Taiyi-Stable-Diffusion-1B-Chinese-v0.1'
+        self.text_encoder = AutoModel.from_pretrained(f"{taiyi_sd_path}/text_encoder")
+        
         self.roberta = self.text_encoder.base_model
         self.max_phrases = max_phrases
         self.use_learnable_extractor = use_learnable_extractor
